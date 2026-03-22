@@ -1,3 +1,1 @@
-Flask==2.3.3
-selenium==4.15.2
 requests==2.31.0
